@@ -289,7 +289,7 @@ async function startWebServer() {
     });
 
     server.on('error', reject);
-    server.listen(websitePort, () => {
+    server.listen(websitePort, '0.0.0.0', () => {
       console.log(`[Web] Install hub listening on ${appBaseUrl}`);
       resolve(server);
     });
