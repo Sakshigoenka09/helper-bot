@@ -39,3 +39,15 @@ as $$
   order by embedding <=> query_embedding
   limit match_count;
 $$;
+
+-- Step 6: Installation store for Slack OAuth
+create table if not exists slack_installations (
+  team_id text primary key,
+  team_name text,
+  bot_token text not null,
+  bot_user_id text,
+  scope text,
+  authed_user_id text,
+  installed_at timestamptz default now(),
+  raw_response jsonb
+);

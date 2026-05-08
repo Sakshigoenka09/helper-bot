@@ -1,14 +1,27 @@
 const { App, LogLevel } = require('@slack/bolt');
-const cron = require('node-cron');
 const { channelIds, historyLimit } = require('../../config');
 const { learnFromMessage, answerQuestion, isGreeting } = require('../../core/assistantEngine');
+const { getSlackInstallationByTeamId } = require('../../services/installationService');
 const { getUserName, resolveMentions } = require('./slackUtils');
 
 const assistantLabel = 'community assistant';
 
 function createSlackApp() {
   return new App({
-    token: process.env.SLACK_BOT_TOKEN,
+    authorize: async ({ teamId }) => {
+      const installation = teamId ? await getSlackInstallationByTeamId(teamId) : null;
+      const botToken = installation?.bot_token || process.env.SLACK_BOT_TOKEN;
+      const botUserId = installation?.bot_user_id || null;
+
+      if (!botToken) {
+        throw new Error(`No Slack bot token found for team ${teamId || 'unknown'}`);
+      }
+
+      return {
+        botToken,
+        botUserId,
+      };
+    },
     signingSecret: process.env.SLACK_SIGNING_SECRET,
     appToken: process.env.SLACK_APP_TOKEN,
     socketMode: true,
@@ -34,6 +47,14 @@ async function normalizeSlackMessage(client, rawMessage, hostBotId) {
     timestamp: rawMessage.ts,
     isBot: !!rawMessage.bot_id || rawMessage.user === hostBotId,
   };
+}
+
+function shouldTrackChannel(channelId) {
+  if (channelIds.length === 0) {
+    return true;
+  }
+
+  return channelIds.includes(channelId);
 }
 
 async function buildHistoryText(client, messages, hostBotId, currentEventTs) {
@@ -82,9 +103,10 @@ async function fetchRecentHistory(client, event, hostBotId) {
   return buildHistoryText(client, channelHistory.messages, hostBotId, event.ts);
 }
 
-async function ingestChannelMessages(client, channelId, hostBotId) {
+async function ingestChannelMessages(client, channelId, hostBotId, token) {
   const oldest = Math.floor(Date.now() / 1000) - 24 * 60 * 60;
   const result = await client.conversations.history({
+    token,
     channel: channelId,
     oldest: oldest.toString(),
     limit: 200,
@@ -97,17 +119,21 @@ async function ingestChannelMessages(client, channelId, hostBotId) {
   }
 }
 
-async function runIngestion(app, hostBotId) {
+async function runIngestion(app, hostBotId, token) {
+  if (channelIds.length === 0) {
+    console.log('[Slack] No SLACK_CHANNEL_IDS configured, skipping startup ingestion.');
+    return;
+  }
+
   console.log(`[Slack] Starting message ingestion for ${channelIds.length} channel(s)...`);
   for (const channelId of channelIds) {
-    await ingestChannelMessages(app.client, channelId, hostBotId);
+    await ingestChannelMessages(app.client, channelId, hostBotId, token);
   }
   console.log('[Slack] Ingestion complete.');
 }
 
 async function startSlackBot() {
   const app = createSlackApp();
-  let hostBotId = null;
 
   app.use(async ({ event, next }) => {
     if (event) {
@@ -116,11 +142,12 @@ async function startSlackBot() {
     await next();
   });
 
-  app.event('app_mention', async ({ event, client, say }) => {
+  app.event('app_mention', async ({ event, client, say, context }) => {
     try {
+      let hostBotId = context.botUserId;
       if (!hostBotId) {
-        const freshAuth = await client.auth.test();
-        hostBotId = freshAuth.user_id;
+        const auth = await client.auth.test();
+        hostBotId = auth.user_id;
       }
 
       const cleanUserText = (event.text || '').replace(new RegExp(`<@${hostBotId}>`, 'g'), '').trim();
@@ -159,17 +186,18 @@ async function startSlackBot() {
     }
   });
 
-  app.message(async ({ message, client }) => {
+  app.message(async ({ message, client, context }) => {
     console.log(`\n[Slack] NEW MESSAGE IN ${message.channel}: "${message.text?.substring(0, 50)}..."`);
 
-    if (!channelIds.includes(message.channel)) {
+    if (!shouldTrackChannel(message.channel)) {
       console.log(`[Slack] Channel ${message.channel} is NOT monitored.`);
       return;
     }
 
+    let hostBotId = context.botUserId;
     if (!hostBotId) {
-      const freshAuth = await client.auth.test();
-      hostBotId = freshAuth.user_id;
+      const auth = await client.auth.test();
+      hostBotId = auth.user_id;
     }
 
     const normalized = await normalizeSlackMessage(client, message, hostBotId);
@@ -179,23 +207,17 @@ async function startSlackBot() {
   await app.start();
   console.log('Slack bot is running.');
 
-  const auth = await app.client.auth.test();
-  hostBotId = auth.user_id;
-  console.log(`Bot User ID: ${auth.user_id}`);
-  console.log(`Bot Name: ${auth.user}`);
+  if (process.env.SLACK_BOT_TOKEN) {
+    const auth = await app.client.auth.test({ token: process.env.SLACK_BOT_TOKEN });
+    console.log(`Primary Bot User ID: ${auth.user_id}`);
+    console.log(`Primary Bot Name: ${auth.user}`);
 
-  await app.client.chat.postMessage({
-    channel: channelIds[0],
-    text: 'Helper Bot online and debugging connection!'
-  });
-
-  await runIngestion(app, hostBotId);
-  cron.schedule('0 * * * *', () => {
-    console.log('[Slack] Hourly ingestion triggered...');
-    runIngestion(app, hostBotId).catch(err => console.error('[Slack] Background execution failed:', err));
-  });
-
-  console.log('Cron job scheduled: ingestion runs every hour.');
+    if (channelIds.length > 0) {
+      await runIngestion(app, auth.user_id, process.env.SLACK_BOT_TOKEN);
+    }
+  } else {
+    console.log('Primary workspace token not configured. Waiting for installed workspaces to interact.');
+  }
 }
 
 module.exports = {
